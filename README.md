@@ -20,3 +20,32 @@ Once the configuration is complete, compile the library by running the following
 make
 ```
 
+Once the library has been successfully compiled, it can be installed locally within the current directory by executing the following command:
+
+
+```bash
+make install
+```
+
+## 1. Run Tests
+
+## 2. Running GEMM Experiments
+
+To run the experiments, a configuration file is provided containing the matrix dimensions corresponding to the convolution operations performed by YOLO after applying the **im2col transformation**.
+
+However, to evaluate other matrix multiplication scenarios, a new configuration file can be created by specifying different matrix dimensions following the provided file format.
+
+The executable generates a **CSV file** containing the experimental results. Therefore, the desired output filename must be specified as an argument when running the executable.
+
+**Note:** Make sure that the output directory already exists before running the experiments, as it will **not be created automatically**. If the directory does not exist, the execution will fail.
+
+To run the experiments using the provided YOLO matrix dimensions, execute:
+
+
+```bash
+./gemm.bin gemm_study/yolo.dat output/yolo.csv
+```
+
+**Note:** The number of threads used during execution can be configured directly in the `gemm.bin` file by modifying the value of the `TH` variable.
+
+
