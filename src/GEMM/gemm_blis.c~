@@ -1,0 +1,1844 @@
+//#define _GNU_SOURCE
+#include <stdio.h>
+#include <omp.h>
+#include <sched.h>
+#include <unistd.h>
+
+#include "gemm_blis.h"
+
+#if C_FP16
+  #include "../FP16/ukernel_32x8_fp16.h"
+#endif
+
+#ifdef BLIS_ON
+  #include "blis.h"
+#endif
+
+#ifdef OPENBLAS_ON
+  #include "cblas.h"
+  #ifdef __cplusplus
+  extern "C" {
+  #endif
+    extern int sgemm_incopy(
+        long m, long n,
+        const float *a, long lda,
+        float *b
+    );
+
+    extern int sgemm_itcopy(
+        long m, long n,
+        const float *a, long lda,
+        float *b
+    );
+    int sgemm_kernel(
+        long M,
+        long N,
+        long K,
+        float alpha,
+        float *A,
+        float *B,
+        float *C,
+        long ldc
+    );
+
+  #ifdef __cplusplus
+  }
+#endif
+#endif
+
+#define BUFFER_SIZE 134217728
+#define IM2COL_SIZE 180000000
+
+#ifndef max
+  #define max(a,b) (((a)>(b))?(a):(b))
+#endif
+
+#ifndef min 
+  #define min(a,b) ((a) > (b)?(b):(a))
+#endif
+
+#ifndef dabs
+  #define dabs(a) ((a) > 0.0 ? (a) : -(a))
+#endif
+
+
+#define Acol(a1,a2)  A[ (a2)*(ldA)+(a1) ]
+#define Bcol(a1,a2)  B[ (a2)*(ldB)+(a1) ]
+#define Ccol(a1,a2)  C[ (a2)*(ldC)+(a1) ]
+#define Mcol(a1,a2)  M[ (a2)*(ldM)+(a1) ]
+
+#define Arow(a1,a2)  A[ (a1)*(ldA)+(a2) ]
+#define Brow(a1,a2)  B[ (a1)*(ldB)+(a2) ]
+#define Crow(a1,a2)  C[ (a1)*(ldC)+(a2) ]
+#define Mrow(a1,a2)  M[ (a1)*(ldM)+(a2) ]
+
+#define Cgrow(a1,a2) Cg[ (a1)*(ldC)+(a2) ]
+#define Cgcol(a1,a2) Cg[ (a2)*(ldC)+(a1) ]
+
+
+//----------------------------------------------------------
+// Global Buffers
+//----------------------------------------------------------
+
+void pack_generic_A ( char orderM, char transM, int mc, int nc, IN_TYPE *M, int ldM, PACK_TYPE *Mc, int RR );
+void pack_generic_MRxkc_A ( char orderM, char transM, int mc, int nc, IN_TYPE *M, int ldM, PACK_TYPE *Mc, int RR );
+void pack_generic_64xkc_A ( char orderM, char transM, int mc, int nc, IN_TYPE *M, int ldM, PACK_TYPE *Mc, int RR );
+void pack_generic_B ( char orderM, char transM, int mc, int nc, IN_TYPE *M, int ldM, PACK_TYPE *Mc, int RR );
+
+void pack_sdot_A    ( char orderA, char transM, int mc, int kc, IN_TYPE *M, int ldM, PACK_TYPE *Mc, int MR );
+void pack_sdot_B    ( char orderB, char transM, int kc, int nc, IN_TYPE *M, int ldM, PACK_TYPE *Mc, int NR );
+
+void pack_6x16_fp16_A    ( char orderA, char transM, int mc, int kc, IN_TYPE *M, int ldM, PACK_TYPE *Mc, int MR );
+void pack_6x16_fp16_B    ( char orderB, char transM, int kc, int nc, IN_TYPE *M, int ldM, PACK_TYPE *Mc, int NR );
+
+void pack_vmadot_Ccol_B(char orderM, char transM, int kc, int nc, IN_TYPE *M, int ldM, PACK_TYPE *Mc, int NR);
+void pack_vmadot_Ccol_A(char orderM, char transM,  int mc, int kc, IN_TYPE *M, int ldM, PACK_TYPE *Mc, int MR);
+
+void pack_bch_RB     (char orderM, char transM, int mc, int nc, BCH_IN_TYPE *M, int ldM, BCH_PACK_TYPE *Mc, int RR );
+void pack_bch_CB     (char orderM, char transM, int mc, int nc, BCH_IN_TYPE *M, int ldM, BCH_PACK_TYPE *Mc, int RR );
+void pack_2x8_int8_B (char orderM, char transM, int kc, int nc, IN_TYPE *M, int ldM, PACK_TYPE *Mc, int NR);
+void pack_2x8_int8_A (char orderM, char transM, int mc, int kc, IN_TYPE *M, int ldM, PACK_TYPE *Mc, int MR);
+
+void bpack_RB( char orderM, char transM, int mc, int nc, BCH_IN_TYPE *M, int ldM, BCH_PACK_TYPE *Mc, int RR );
+void bpack_CB( char orderM, char transM, int mc, int nc, BCH_IN_TYPE *M, int ldM, BCH_PACK_TYPE *Mc, int RR );
+
+void gemm_base_Cresident( char orderC, int m, int n, int k, OUT_TYPE alpha, IN_TYPE *A, int ldA, 
+                          IN_TYPE *B, int ldB, OUT_TYPE beta,  OUT_TYPE *C, int ldC );
+
+void gemm_B3A2C0( char orderA, char orderB, char orderC, char transA, char transB, 
+                  int m, int n, int k, OUT_TYPE alpha, 
+	          const IN_TYPE *A, int ldA, const IN_TYPE *B, int ldB, 
+		  OUT_TYPE beta,  OUT_TYPE *C, int ldC, 
+		  PACK_TYPE *Ac, PACK_TYPE *Bc, int loop, OUT_TYPE *Ctmp, char prepack);
+
+void gemm_prepack_B3A2C0( char orderA, char orderB, char orderC, char transA, char transB, 
+                          int m, int n, int k, OUT_TYPE alpha, 
+	                  const PACK_TYPE *A, int ldA, const IN_TYPE *B, int ldB, 
+		          OUT_TYPE beta,  OUT_TYPE *C, int ldC, 
+		          PACK_TYPE *Ac, PACK_TYPE *Bc, int loop, OUT_TYPE *Ctmp, char prepack);
+
+
+//Packing Wrapper
+#if defined(RISCV)
+  #if defined(K1) && defined(Q_INT8_INT32)
+    #ifdef IME_ENABLE
+      #define PACK_A pack_vmadot_Ccol_A
+      #define PACK_B pack_vmadot_Ccol_B
+    #else
+      #define PACK_A pack_generic_A
+      #define PACK_B pack_generic_B
+    #endif
+  #else
+    #define PACK_A pack_generic_A
+    #define PACK_B pack_generic_B
+  #endif
+#elif defined(A78AE) && defined(Q_INT8_INT32)
+  #define PACK_A pack_sdot_A
+  #define PACK_B pack_sdot_B
+#elif defined(NQ_FP16)
+  #define PACK_A pack_6x16_fp16_A
+  #define PACK_B pack_6x16_fp16_B
+#else
+  #if defined(Q_INT8_INT32)
+    #define PACK_A pack_2x8_int8_A
+    #define PACK_B pack_2x8_int8_B
+  #else
+    #define PACK_A pack_generic_A
+    #define PACK_B pack_generic_B
+  #endif
+#endif
+
+
+
+#define IM2COL  _im2col_rvv
+
+#if defined(NQ_FP16) 
+  #define IM2COL_PACK _im2col_pack_rvv_fp16
+#else
+  #define IM2COL_PACK _im2col_pack_rvv
+#endif
+
+typedef struct im2col_data {
+    const float* input_data;
+    float*  finput_data;
+    int64_t kH;
+    int64_t kW;
+    int64_t dH;
+    int64_t dW;
+    int64_t padH;
+    int64_t padW;
+    int64_t n_input_plane;
+    int64_t input_height;
+    int64_t input_width;
+    int64_t output_height;
+    int64_t output_width;
+} im2col_data_t;
+
+PACK_TYPE *_im2col    = NULL;
+PACK_TYPE *Ac         = NULL;
+PACK_TYPE *Bc         = NULL;
+OUT_TYPE  *Ctmp       = NULL;
+OUT_TYPE  *Cc         = NULL;
+int        TH         = 1;
+int        pack_ready = 0;
+float     *ref_im2col = NULL;
+im2col_data_t im2col_data;
+
+//Column-major
+#define UKERNEL(mr, nr, kc, A, B, C, beta, ldA, ldB, ldC) \
+{ \
+  if (mr == MR && nr == NR) \
+    uk(mr, nr, kc, A, B, C, beta, ldA, ldB, ldC); \
+  else { \
+    uk(mr, nr, kc, A, B, Ctmp_th, 0, ldA, ldB, MR);\
+    for (int j = 0; j < nr; j++)\
+    for (int i = 0; i < mr; i++)\
+      C[j*ldC + i] = (betaI) * C[j*ldC + i] + Ctmp_th[j * MR + i];\
+  }\
+}
+
+#ifdef OPENBLAS_ON
+static inline CBLAS_TRANSPOSE
+to_cblas_transpose(const char* t)
+{
+    return (*t == 'N') ? CblasNoTrans :
+           (*t == 'T') ? CblasTrans :
+                         CblasConjTrans;
+}
+#endif
+
+
+
+
+static inline int64_t max64(int64_t a, int64_t b) { return a > b ? a : b; }
+
+//Wrapper for Pytorch. Interface like aTen.
+void im2col_pack_rvv(const float* input_data, float* finput_data,
+                     int64_t kH, int64_t kW, int64_t dH, int64_t dW, int64_t padH, int64_t padW,
+                     int64_t n_input_plane, int64_t input_height, int64_t input_width,
+                     int64_t output_height, int64_t output_width) {
+
+    if (_im2col == NULL) posix_memalign((void **)&_im2col, 64, IM2COL_SIZE);
+    
+    im2col_data.input_data    = input_data;
+    im2col_data.finput_data   = finput_data;
+    im2col_data.kH            = kH;
+    im2col_data.kW            = kW;
+    im2col_data.dH            = dH;
+    im2col_data.dW            = dW;
+    im2col_data.padH          = padH;
+    im2col_data.padW          = padW;
+    im2col_data.n_input_plane = n_input_plane;
+    im2col_data.input_height  = input_height;
+    im2col_data.input_width   = input_width;
+    im2col_data.output_height = output_height;
+    im2col_data.output_width  = output_width;
+
+    ref_im2col = finput_data; 
+    pack_ready = 1;
+
+}
+
+#define PK_MR YOLO_MR   /* 16, debe coincidir con la GEMM */
+#define PK_KC YOLO_KC   /* 512, debe coincidir con la GEMM */
+
+static inline int64_t ceil_div64(int64_t a, int64_t b) { return (a + b - 1) / b; }
+
+/* Escribe len ceros en las posiciones virtuales p..p+len-1 de una fila k */
+static inline void pk_zero(float *base, size_t ps, int64_t p, int64_t len) {
+    while (len > 0) {
+        int64_t po = p % PK_MR;
+        int64_t n  = PK_MR - po; if (n > len) n = len;
+        memset(base + (size_t)(p / PK_MR) * ps + po, 0, sizeof(float) * n);
+        p += n; len -= n;
+    }
+}
+
+/* Copia contigua (dW == 1) */
+static inline void pk_copy(float *base, size_t ps, int64_t p, const float *s, int64_t len) {
+    while (len > 0) {
+        int64_t po = p % PK_MR;
+        int64_t n  = PK_MR - po; if (n > len) n = len;
+        memcpy(base + (size_t)(p / PK_MR) * ps + po, s, sizeof(float) * n);
+        p += n; s += n; len -= n;
+    }
+}
+
+
+typedef struct { int32_t y, xs, len, lane; } seg_t;
+
+void _im2col_pack_rvv(const float* input_data, float* apack,
+                      int64_t kH, int64_t kW, int64_t dH, int64_t dW,
+                      int64_t padH, int64_t padW,
+                      int64_t n_input_plane, int64_t input_height, int64_t input_width,
+                      int64_t output_height, int64_t output_width) {
+
+    const int64_t M     = output_height * output_width;
+    const int64_t K     = n_input_plane * kH * kW;
+    const int64_t npan  = ceil_div64(M, PK_MR);
+    const size_t  M_pad = (size_t)npan * PK_MR;
+    const int64_t nkb   = ceil_div64(K, PK_KC);
+    const int64_t khw   = kH * kW;
+
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int64_t kb = 0; kb < nkb; kb++) {
+        for (int64_t ib = 0; ib < npan; ib++) {
+
+            const int64_t pc = kb * PK_KC;
+            const int64_t kc = (K - pc < PK_KC) ? (K - pc) : PK_KC;
+            const int64_t p0 = ib * PK_MR;
+            const int nvalid = (int)((M - p0 < PK_MR) ? (M - p0) : PK_MR);
+
+            /* Segmentos del panel: tramos de píxeles dentro de la misma fila y.
+               No dependen de k, se calculan una vez por panel. */
+            seg_t seg[PK_MR];
+            int ns = 0;
+            {
+                int64_t p = p0; int left = nvalid, lane = 0;
+                while (left > 0) {
+                    int64_t y = p / output_width, x = p % output_width;
+                    int len = (int)(output_width - x); if (len > left) len = left;
+                    seg[ns].y = (int32_t)y; seg[ns].xs = (int32_t)x;
+                    seg[ns].len = len;      seg[ns].lane = lane;
+                    ns++; p += len; left -= len; lane += len;
+                }
+            }
+
+            float *dst = apack + (size_t)pc * M_pad + (size_t)ib * PK_MR * kc;
+
+            /* Estado (nip, kh, kw) de la primera fila k = pc; luego se incrementa */
+            int64_t nip  = pc / khw;
+            int64_t rest = pc % khw;
+            int64_t kh   = rest / kW;
+            int64_t kw   = rest % kW;
+
+            for (int64_t kk = 0; kk < kc; kk++, dst += PK_MR) {
+                const float *src = input_data + (size_t)nip * input_height * input_width;
+
+                if (nvalid < PK_MR) {               /* panel de cola: lanes sobrantes a 0 */
+                    size_t vl = __riscv_vsetvl_e32m2(PK_MR);
+                    __riscv_vse32_v_f32m2(dst, __riscv_vfmv_v_f_f32m2(0.0f, vl), vl);
+                }
+
+                for (int s = 0; s < ns; s++) {
+                    const int len = seg[s].len;
+                    float *d = dst + seg[s].lane;
+                    const int64_t iy = (int64_t)seg[s].y * dH - padH + kh;
+                    size_t vl = __riscv_vsetvl_e32m2(len);
+
+                    if (iy < 0 || iy >= input_height) {
+                        __riscv_vse32_v_f32m2(d, __riscv_vfmv_v_f_f32m2(0.0f, vl), vl);
+                        continue;
+                    }
+
+                    const float  *row = src + (size_t)iy * input_width;
+                    const int64_t ix0 = (int64_t)seg[s].xs * dW - padW + kw;
+                    const int64_t ixl = ix0 + (int64_t)(len - 1) * dW;
+
+                    if (ix0 >= 0 && ixl < input_width) {          /* camino rápido */
+                        vfloat32m2_t v = (dW == 1)
+                            ? __riscv_vle32_v_f32m2(row + ix0, vl)
+                            : __riscv_vlse32_v_f32m2(row + ix0,
+                                                     (ptrdiff_t)(dW * sizeof(float)), vl);
+                        __riscv_vse32_v_f32m2(d, v, vl);
+                    } else {                                       /* borde: escalar */
+                        for (int j = 0; j < len; j++) {
+                            int64_t ix = ix0 + (int64_t)j * dW;
+                            d[j] = (ix < 0 || ix >= input_width) ? 0.0f : row[ix];
+                        }
+                    }
+                }
+
+                /* siguiente k = (nip, kh, kw) */
+                if (++kw == kW) { kw = 0; if (++kh == kH) { kh = 0; nip++; } }
+            }
+        }
+    }
+
+    pack_ready = 0;
+    ref_im2col = NULL;
+}
+
+
+
+void _im2col_rvv(const float* input_data, float* finput_data,
+                 int64_t kH, int64_t kW, int64_t dH, int64_t dW, int64_t padH, int64_t padW,
+                 int64_t n_input_plane, int64_t input_height, int64_t input_width,
+                 int64_t output_height, int64_t output_width) {
+
+    #pragma omp parallel for
+    for (int64_t k = 0; k < n_input_plane * kH * kW; k++) {
+        int64_t nip  = k / (kH * kW);
+        int64_t rest = k % (kH * kW);
+        int64_t kh   = rest / kW;
+        int64_t kw   = rest % kW;
+
+        float *dst = finput_data
+                   + nip * ((size_t)kH * kW * output_height * output_width)
+                   + kh  * ((size_t)kW * output_height * output_width)
+                   + kw  * ((size_t)output_height * output_width);
+
+        const float *src = input_data + nip * ((size_t)input_height * input_width);
+
+        if (padW > 0 || padH > 0) {
+            for (int64_t y = 0; y < output_height; y++) {
+                int64_t iy = y * dH - padH + kh;
+
+                if (iy < 0 || iy >= input_height) {
+                    memset(dst + (size_t)y * output_width, 0,
+                           sizeof(float) * output_width);
+                } else if (dW == 1) {
+                    int64_t ix   = 0 - padW + kw;
+                    int64_t lpad = max64(0, padW - kw);
+                    int64_t rpad = max64(0, padW - (kW - kw - 1));
+
+                    if (output_width - rpad - lpad <= 0) {
+                        memset(dst + (size_t)y * output_width, 0,
+                               sizeof(float) * output_width);
+                    } else {
+                        if (lpad > 0)
+                            memset(dst + (size_t)y * output_width, 0,
+                                   sizeof(float) * lpad);
+                        memcpy(dst + (size_t)y * output_width + lpad,
+                               src + (size_t)iy * input_width + ix + lpad,
+                               sizeof(float) * (output_width - rpad - lpad));
+                        if (rpad > 0)
+                            memset(dst + (size_t)y * output_width + output_width - rpad, 0,
+                                   sizeof(float) * rpad);
+                    }
+                } else {
+                    for (int64_t x = 0; x < output_width; x++) {
+                        int64_t ix = x * dW - padW + kw;
+                        if (ix < 0 || ix >= input_width)
+                            dst[(size_t)y * output_width + x] = 0.0f;
+                        else
+                            dst[(size_t)y * output_width + x] =
+                                src[(size_t)iy * input_width + ix];
+                    }
+                }
+            }
+        } else {
+            for (int64_t y = 0; y < output_height; y++) {
+                int64_t iy = y * dH + kh;
+                int64_t ix = 0 + kw;
+
+                if (dW == 1) {
+                    memcpy(dst + (size_t)y * output_width,
+                           src + (size_t)iy * input_width + ix,
+                           sizeof(float) * output_width);
+                } else {
+                    for (int64_t x = 0; x < output_width; x++)
+                        dst[(size_t)y * output_width + x] =
+                            src[(size_t)iy * input_width + ix + x * dW];
+                }
+            }
+        }
+    }
+}
+
+
+static inline int64_t i2c_cdiv(int64_t a, int64_t b) { return (a + b - 1) / b; }
+
+void _im2col_rvv_fp16(const float *input_data, fp16_t *finput_data,
+                      int64_t kH, int64_t kW, int64_t dH, int64_t dW,
+                      int64_t padH, int64_t padW,
+                      int64_t n_input_plane, int64_t input_height, int64_t input_width,
+                      int64_t output_height, int64_t output_width)
+{
+    const int64_t OW = output_width;
+
+    #pragma omp parallel for
+    for (int64_t k = 0; k < n_input_plane * kH * kW; k++) {
+        const int64_t nip  = k / (kH * kW);
+        const int64_t rest = k % (kH * kW);
+        const int64_t kh   = rest / kW;
+        const int64_t kw   = rest % kW;
+
+        fp16_t *dst = finput_data + (size_t)k * output_height * OW;
+        const float *src = input_data + (size_t)nip * input_height * input_width;
+
+        /* x validos: ix = x*dW - padW + kw dentro de [0, input_width) (con pad = 0 sale [0, OW)) */
+        int64_t lo  = (padW > kw) ? i2c_cdiv(padW - kw, dW) : 0;
+        int64_t num = input_width + padW - kw;
+        int64_t hi  = (num > 0) ? i2c_cdiv(num, dW) : 0;
+        if (hi > OW) hi = OW;
+        if (lo > hi) lo = hi;
+
+        for (int64_t y = 0; y < output_height; y++) {
+            fp16_t *d = dst + (size_t)y * OW;
+            const int64_t iy = y * dH - padH + kh;
+
+            if (iy < 0 || iy >= input_height || lo >= hi) {
+                memset(d, 0, sizeof(fp16_t) * OW);      /* +0.0 en fp16 = bits a cero */
+                continue;
+            }
+            const float *row = src + (size_t)iy * input_width + (lo * dW - padW + kw);
+
+            if (lo > 0) memset(d, 0, sizeof(fp16_t) * lo);
+            for (int64_t x = lo, j = 0; x < hi; x++, j += dW) d[x] = (fp16_t)row[j];
+            if (hi < OW) memset(d + hi, 0, sizeof(fp16_t) * (OW - hi));
+        }
+    }
+}
+
+
+void _im2col_pack_rvv_fp16(const float *input_data, fp16_t *apack,
+                           int64_t kH, int64_t kW, int64_t dH, int64_t dW,
+                           int64_t padH, int64_t padW,
+                           int64_t n_input_plane, int64_t input_height, int64_t input_width,
+                           int64_t output_height, int64_t output_width)
+{
+    const int64_t M     = output_height * output_width;
+    const int64_t K     = n_input_plane * kH * kW;
+    const int64_t npan  = i2c_cdiv(M, PK_MR);
+    const size_t  M_pad = (size_t)npan * PK_MR;
+    const int64_t nkb   = i2c_cdiv(K, PK_KC);
+    const int64_t khw   = kH * kW;
+
+    /* Cada tarea (bloque de k, panel de 16 pixeles) rellena un trozo contiguo de 16*kc elementos */
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int64_t kb = 0; kb < nkb; kb++) {
+        for (int64_t ib = 0; ib < npan; ib++) {
+
+            const int64_t pc = kb * PK_KC;
+            const int64_t kc = (K - pc < PK_KC) ? (K - pc) : PK_KC;
+            const int64_t p0 = ib * PK_MR;
+            const int nvalid = (int)((M - p0 < PK_MR) ? (M - p0) : PK_MR);
+
+            /* Tramos del panel dentro de una misma fila y de salida; no dependen de k */
+            seg_t seg[PK_MR];
+            int ns = 0;
+            {
+                int64_t p = p0; int left = nvalid, lane = 0;
+                while (left > 0) {
+                    const int64_t y = p / output_width, x = p % output_width;
+                    int len = (int)(output_width - x); if (len > left) len = left;
+                    seg[ns].y = (int32_t)y; seg[ns].xs = (int32_t)x;
+                    seg[ns].len = len;      seg[ns].lane = lane;
+                    ns++; p += len; left -= len; lane += len;
+                }
+            }
+
+            fp16_t *dst = apack + (size_t)pc * M_pad + (size_t)ib * PK_MR * kc;
+
+            /* (nip, kh, kw) de la fila k = pc; despues se incrementa */
+            int64_t nip  = pc / khw;
+            int64_t rest = pc % khw;
+            int64_t kh   = rest / kW;
+            int64_t kw   = rest % kW;
+
+            for (int64_t kk = 0; kk < kc; kk++, dst += PK_MR) {
+                const float *src = input_data + (size_t)nip * input_height * input_width;
+
+                if (nvalid < PK_MR) memset(dst, 0, sizeof(fp16_t) * PK_MR);   /* panel de cola */
+
+                for (int s = 0; s < ns; s++) {
+                    const int len = seg[s].len;
+                    fp16_t *d = dst + seg[s].lane;
+                    const int64_t iy = (int64_t)seg[s].y * dH - padH + kh;
+
+                    if (iy < 0 || iy >= input_height) {
+                        memset(d, 0, sizeof(fp16_t) * len);
+                        continue;
+                    }
+                    const float  *row = src + (size_t)iy * input_width;
+                    const int64_t ix0 = (int64_t)seg[s].xs * dW - padW + kw;
+                    const int64_t ixl = ix0 + (int64_t)(len - 1) * dW;
+
+                    if (ix0 >= 0 && ixl < input_width) {                 /* camino habitual */
+                        for (int j = 0; j < len; j++) d[j] = (fp16_t)row[ix0 + (int64_t)j * dW];
+                    } else {                                              /* bordes */
+                        for (int j = 0; j < len; j++) {
+                            const int64_t ix = ix0 + (int64_t)j * dW;
+                            d[j] = (ix < 0 || ix >= input_width) ? (fp16_t)0 : (fp16_t)row[ix];
+                        }
+                    }
+                }
+
+                /* siguiente k = (nip, kh, kw) */
+                if (++kw == kW) { kw = 0; if (++kh == kH) { kh = 0; nip++; } }
+            }
+        }
+    }
+
+    pack_ready = 0;
+    ref_im2col = NULL;
+}
+
+void silu_kernel_rvv(const float* input, float* output, size_t n) {
+    const size_t BLOCK = 4096;          // 16 KB por bloque (múltiplo de 64 B)
+    const size_t MIN_PARALLEL = 16384;  // por debajo, se ejecuta en un solo hilo
+
+    const float LOG2E = 1.44269504f;
+    const float LN2   = 0.69314718f;
+    const float C5 = 1.0f / 120.0f;
+    const float C4 = 1.0f / 24.0f;
+    const float C3 = 1.0f / 6.0f;
+    const float C2 = 0.5f;
+
+    const long nblocks = (long)((n + BLOCK - 1) / BLOCK);
+
+    #pragma omp parallel for schedule(static) if(n >= MIN_PARALLEL)
+    for (long b = 0; b < nblocks; ++b) {
+        size_t start = (size_t)b * BLOCK;
+        size_t len   = min(BLOCK, n - start);
+
+        const float* in  = input  + start;
+        float*       out = output + start;
+
+        while (len > 0) {
+            size_t vl = __riscv_vsetvl_e32m2(len);
+            vfloat32m2_t x = __riscv_vle32_v_f32m2(in, vl);
+
+            // y = clamp(-x, -80, 80)
+            vfloat32m2_t y = __riscv_vfneg_v_f32m2(x, vl);
+            y = __riscv_vfmax_vf_f32m2(y, -80.0f, vl);
+            y = __riscv_vfmin_vf_f32m2(y,  80.0f, vl);
+
+            // k = round(y*log2e); r = y - k*ln2
+            vint32m2_t   k  = __riscv_vfcvt_x_f_v_i32m2(__riscv_vfmul_vf_f32m2(y, LOG2E, vl), vl);
+            vfloat32m2_t kf = __riscv_vfcvt_f_x_v_f32m2(k, vl);
+            vfloat32m2_t r  = __riscv_vfnmsac_vf_f32m2(y, LN2, kf, vl);
+
+            // exp(r) ≈ ((((C5 r + C4) r + C3) r + C2) r + 1) r + 1
+            vfloat32m2_t p = __riscv_vfmv_v_f_f32m2(C5, vl);
+            p = __riscv_vfmadd_vv_f32m2(p, r, __riscv_vfmv_v_f_f32m2(C4, vl), vl);
+            p = __riscv_vfmadd_vv_f32m2(p, r, __riscv_vfmv_v_f_f32m2(C3, vl), vl);
+            p = __riscv_vfmadd_vv_f32m2(p, r, __riscv_vfmv_v_f_f32m2(C2, vl), vl);
+            p = __riscv_vfmadd_vv_f32m2(p, r, __riscv_vfmv_v_f_f32m2(1.0f, vl), vl);
+            p = __riscv_vfmadd_vv_f32m2(p, r, __riscv_vfmv_v_f_f32m2(1.0f, vl), vl);
+
+            // exp(-x) = p * 2^k
+            vint32m2_t   bits = __riscv_vsll_vx_i32m2(__riscv_vadd_vx_i32m2(k, 127, vl), 23, vl);
+            vfloat32m2_t e = __riscv_vfmul_vv_f32m2(p, __riscv_vreinterpret_v_i32m2_f32m2(bits), vl);
+
+            // d = 1 + exp(-x)
+            vfloat32m2_t d = __riscv_vfadd_vf_f32m2(e, 1.0f, vl);
+
+            // 1/d con vfrec7 + 2 iteraciones de Newton: rcp = rcp * (2 - d*rcp)
+            vfloat32m2_t rcp = __riscv_vfrec7_v_f32m2(d, vl);
+            vfloat32m2_t t = __riscv_vfmv_v_f_f32m2(2.0f, vl);
+            t   = __riscv_vfnmsac_vv_f32m2(t, d, rcp, vl);
+            rcp = __riscv_vfmul_vv_f32m2(rcp, t, vl);
+            t = __riscv_vfmv_v_f_f32m2(2.0f, vl);
+            t   = __riscv_vfnmsac_vv_f32m2(t, d, rcp, vl);
+            rcp = __riscv_vfmul_vv_f32m2(rcp, t, vl);
+
+            // silu = x * (1/d)
+            __riscv_vse32_v_f32m2(out, __riscv_vfmul_vv_f32m2(x, rcp, vl), vl);
+
+            in  += vl;
+            out += vl;
+            len -= vl;
+        }
+    }
+}
+
+
+typedef void (*pack_intrinsic_fp32) (char orderM, char transM, int mc, int nc, IN_TYPE *M, int ldM, PACK_TYPE *Mc, int RR );
+
+
+void gemv_rvv_fp32(int m, int k,
+                   const IN_TYPE *A, int lda,
+                   const IN_TYPE *B,
+                   OUT_TYPE beta,
+                   OUT_TYPE *C, int ldc)
+{
+    #pragma omp parallel
+    {
+        int th_id  = omp_get_thread_num();
+        int th_num = omp_get_num_threads();
+
+        int rows_per_thread = (m + th_num - 1) / th_num;
+
+        int start = th_id * rows_per_thread;
+        int end   = start + rows_per_thread;
+
+        if (end > m)   end = m;
+
+	if (0 && k == 9) {
+          for (int i = start; i < end; )
+          {
+              size_t vl = __riscv_vsetvl_e32m2(end - i);
+  
+              vfloat32m2_t acc;
+  
+              if (beta == 0.0f)
+                  acc = __riscv_vfmv_v_f_f32m2(0.0f, vl);
+              else
+                  acc = __riscv_vle32_v_f32m2(&C[i], vl);
+  
+              vfloat32m2_t a0 = __riscv_vle32_v_f32m2(&A[i + 0 * lda], vl);
+              vfloat32m2_t a1 = __riscv_vle32_v_f32m2(&A[i + 1 * lda], vl);
+              vfloat32m2_t a2 = __riscv_vle32_v_f32m2(&A[i + 2 * lda], vl);
+              vfloat32m2_t a3 = __riscv_vle32_v_f32m2(&A[i + 3 * lda], vl);
+              vfloat32m2_t a4 = __riscv_vle32_v_f32m2(&A[i + 4 * lda], vl);
+              vfloat32m2_t a5 = __riscv_vle32_v_f32m2(&A[i + 5 * lda], vl);
+              vfloat32m2_t a6 = __riscv_vle32_v_f32m2(&A[i + 6 * lda], vl);
+              vfloat32m2_t a7 = __riscv_vle32_v_f32m2(&A[i + 7 * lda], vl);
+              vfloat32m2_t a8 = __riscv_vle32_v_f32m2(&A[i + 8 * lda], vl);
+  
+              acc = __riscv_vfmacc_vf_f32m2(acc, B[0], a0, vl);
+              acc = __riscv_vfmacc_vf_f32m2(acc, B[1], a1, vl);
+              acc = __riscv_vfmacc_vf_f32m2(acc, B[2], a2, vl);
+              acc = __riscv_vfmacc_vf_f32m2(acc, B[3], a3, vl);
+              acc = __riscv_vfmacc_vf_f32m2(acc, B[4], a4, vl);
+              acc = __riscv_vfmacc_vf_f32m2(acc, B[5], a5, vl);
+              acc = __riscv_vfmacc_vf_f32m2(acc, B[6], a6, vl);
+              acc = __riscv_vfmacc_vf_f32m2(acc, B[7], a7, vl);
+              acc = __riscv_vfmacc_vf_f32m2(acc, B[8], a8, vl);
+  
+              __riscv_vse32_v_f32m2(&C[i], acc, vl);
+  
+              i += vl;
+          }
+	
+	} else {
+
+          for (int i = start; i < end; )
+          {
+              size_t vl = __riscv_vsetvl_e32m8(end - i);
+  
+              vfloat32m8_t acc;
+  
+              if (beta == 0.0f)
+                  acc = __riscv_vfmv_v_f_f32m8(0.0f, vl);
+              else
+                  acc = __riscv_vle32_v_f32m8(&C[i], vl);
+  
+              for (int p = 0; p < k; ++p)
+              {
+                  vfloat32m8_t a =
+                      __riscv_vle32_v_f32m8(&A[i + p * lda], vl);
+  
+                  acc = __riscv_vfmacc_vf_f32m8(
+                      acc, B[p], a, vl);
+              }
+  
+              __riscv_vse32_v_f32m8(&C[i], acc, vl);
+  
+              i += vl;
+          }
+      }
+   }
+}
+
+void gemm_rvv(char *transa, char *transb, int *m, int *n, int *k, OUT_TYPE *alpha, const IN_TYPE *a, int *lda, const IN_TYPE *b, int *ldb, OUT_TYPE *beta, OUT_TYPE *c, int *ldc) {
+
+   #ifdef OPENBLAS_ON
+
+   int m_ = *m, n_ = *n, k_ = *k, lda_ = *lda, ldb_ = *ldb, ldc_ = *ldc;
+   float alpha_ = *alpha, beta_ = *beta;
+
+   //openblas_set_num_threads(8);
+
+   cblas_sgemm(CblasColMajor,
+      to_cblas_transpose(transa), 
+      to_cblas_transpose(transb),
+      m_, n_, k_,
+      alpha_,
+      a, lda_,
+      b, ldb_,
+      beta_,
+      c, ldc_);
+
+   //openblas_set_num_threads(1); 
+   
+   return;
+   #endif
+   
+   #ifdef BLIS_ON
+   
+   sgemm_(transa, transb,
+          m, n, k,
+          alpha,
+          a, lda,
+          b, ldb,
+          beta,
+          c, ldc);
+
+     return;
+   #endif
+
+
+  // Quick return if possible
+  if ( (*m==0)||(*n==0)||(((*alpha==0.0)||(*k==0))&&(*beta==1.0)) ) return;
+
+  int loop;
+
+  //----------------------------------------------------------
+  // GEMM CALL
+  //----------------------------------------------------------
+  char orderA  = 'C';
+  char orderB  = 'C';
+  char orderC  = 'C';
+  char transA  = *transa;
+  char transB  = *transb;
+  char prepack = 0;
+  
+  if (!Ac) {
+    Ac   = (PACK_TYPE *)malloc(BUFFER_SIZE * sizeof(PACK_TYPE));
+    Ctmp = (OUT_TYPE  *)malloc(262144      * sizeof(OUT_TYPE));
+    #pragma omp parallel
+    { TH = omp_get_num_threads(); }
+  }
+
+  Bc = Ac + (*m) * (*k) * 2;
+
+
+  if (pack_ready) {
+      const int use_prepack = (ref_im2col == a && transA == 'N' && transB == 'N' && *n > 1);
+    
+      pack_ready = 0; 
+      ref_im2col = NULL;
+
+      if (use_prepack) {
+        IM2COL_PACK (im2col_data.input_data, _im2col, 
+		     im2col_data.kH, im2col_data.kW, im2col_data.dH, im2col_data.dW, 
+		     im2col_data.padH, im2col_data.padW, im2col_data.n_input_plane, 
+		     im2col_data.input_height, im2col_data.input_width, 
+		     im2col_data.output_height, im2col_data.output_width);
+  
+        gemm_prepack_B3A2C0( orderA, orderB, orderC, transA, transB, *m, *n, *k, *alpha, _im2col, *lda, b, *ldb, *beta, 
+		             c, *ldc, Ac, Bc, LOOP_IR, Ctmp, prepack);
+  
+        return;
+  
+      }
+  
+      IM2COL(im2col_data.input_data, im2col_data.finput_data, 
+             im2col_data.kH, im2col_data.kW, im2col_data.dH, im2col_data.dW, 
+             im2col_data.padH, im2col_data.padW, im2col_data.n_input_plane, 
+             im2col_data.input_height, im2col_data.input_width, 
+             im2col_data.output_height, im2col_data.output_width);
+      
+  }
+      
+  if (*n == 1) gemv_rvv_fp32(*m, *k, a, *lda, b, *beta, c, *ldc);
+  else         gemm_B3A2C0( orderA, orderB, orderC, transA, transB, *m, *n, *k, *alpha, a, *lda, b, *ldb, *beta, 
+  		                c, *ldc, Ac, Bc, LOOP_IR, Ctmp, prepack);
+
+  return;
+
+}
+
+
+
+void gemm_B3A2C0( char orderA, char orderB, char orderC, char transA, char transB, 
+                  int m, int n, int k, OUT_TYPE alpha, 
+	          const IN_TYPE *A, int ldA, const IN_TYPE *B, int ldB, 
+		  OUT_TYPE beta,  OUT_TYPE *C, int ldC, 
+		  PACK_TYPE *Ac, PACK_TYPE *Bc, 
+		  int loop, OUT_TYPE *Ctmp, char prepack) {
+
+  int ic, jc, pc, mc, nc, kc, ir, jr, mr, nr, j, i, kc_chunk, kc_packA, kc_packB, mc_pack;
+  size_t jr_lim, ir_lim;
+  
+  OUT_TYPE one = 1, betaI; 
+  const IN_TYPE *Bptr, *Aptr;
+  OUT_TYPE *Cptr;
+  OUT_TYPE *Ctmp_th;
+  
+  size_t jr_init, jr_limit, ir_init, ir_limit;
+  int th_id, th_num;
+
+  int NC = n;
+  int MC = YOLO_MC;
+  int KC = YOLO_KC;
+
+  int MR, NR;
+  pack_intrinsic_fp32 pack;
+
+  #ifdef NQ_FP32
+    uk_intrinsic_fp32 uk;
+    if (n==4) {MR=YOLO_MR; NR=4;       uk = ukernel_16x4_fp32;}
+    else      {MR=YOLO_MR; NR=YOLO_NR; uk = ukernel_16x8_fp32;}
+  #else
+    uk_intrinsic_fp16 uk;
+    if (n==4) {MR=YOLO_MR; NR=4;       uk = ukernel_16x4_fp16;}
+    else      {MR=YOLO_MR; NR=YOLO_NR; uk = ukernel_16x8_fp16;}
+  #endif
+  
+  //MR=YOLO_MR; NR=4;       uk = ukernel_16x4_fp32;
+
+  if (transA == 'T') pack = PACK_A;
+  else               pack = pack_generic_MRxkc_A;
+
+  const size_t M_pad = ((size_t)m + MR - 1) / MR * MR;
+  
+  #pragma omp parallel private(jr_init, jr_limit, ir_init, ir_limit, jc, nc, pc, kc, Aptr, Bptr, ic, mc, Cptr, \
+                               Ctmp_th, jr, nr, ir, mr, th_id, th_num, betaI, kc_chunk, kc_packA, kc_packB, mc_pack)
+  {
+
+  th_id   = omp_get_thread_num();
+  th_num  = omp_get_num_threads();
+  Ctmp_th = &Ctmp[th_id * MR * NR];
+  
+  for ( jc=0; jc<n; jc+=NC ) {
+    nc = min(n-jc, NC); 
+    int its_nc = (int) ceil((double)nc/NR/th_num);
+
+    if (loop == LOOP_JR) { jr_limit = min(nc,(th_id+1)*(its_nc*NR)); jr_init = th_id*(its_nc*NR); }
+    else { jr_limit = nc; jr_init = 0;}
+
+    for ( pc=0; pc<k; pc+=KC ) {
+      kc = min(k-pc, KC); 
+
+      if      ( (transB=='N')&&(orderB=='C') ) Bptr = &Bcol(pc, jc + its_nc * NR * th_id);
+      else if ( (transB=='N')&&(orderB=='R') ) Bptr = &Brow(pc, jc + its_nc * NR * th_id);
+      else if ( (transB=='T')&&(orderB=='C') ) Bptr = &Bcol(jc + its_nc * NR * th_id, pc);
+      else                                     Bptr = &Brow(jc + its_nc * NR * th_id, pc);
+
+      PACK_B( orderB, transB, kc, min(its_nc * NR, nc - its_nc * NR * th_id), 
+              Bptr, ldB, Bc + kc * its_nc * NR * th_id, NR);
+
+      if ( pc==0 ) betaI = beta;
+      else betaI = one;
+
+      #pragma omp barrier 
+
+      for ( ic=0; ic<m; ic+=MC ) {
+        mc = min(m-ic, MC); 
+	mc_pack = (int)ceil((double)mc / (double)MR) * MR;
+	int its_mc = (int) ceil((double)mc/MR/omp_get_num_threads());
+	
+	if (loop == LOOP_IR) { ir_limit = min(mc,(th_id+1)*(its_mc*MR)); ir_init = th_id*(its_mc*MR); }
+	else { ir_limit = mc; ir_init = 0;}
+
+	const PACK_TYPE *Ablk;
+
+        if      ( (transA=='N')&&(orderA=='C') ) Aptr = &Acol(ic + its_mc * MR * th_id, pc);
+        else if ( (transA=='N')&&(orderA=='R') ) Aptr = &Arow(ic + its_mc * MR * th_id, pc);
+        else if ( (transA=='T')&&(orderA=='C') ) Aptr = &Acol(pc, ic + its_mc * MR * th_id);
+        else                                     Aptr = &Arow(pc, ic + its_mc * MR * th_id);
+
+        pack(orderA, transA, min(its_mc * MR, mc - its_mc * MR * th_id), kc, 
+             Aptr, ldA, Ac + kc * its_mc * MR * th_id, MR);
+
+        Ablk = Ac;
+
+	for (jr=jr_init; jr<jr_limit; jr+=NR) {
+          nr = min(nc-jr, NR); 
+          for (ir=ir_init; ir<ir_limit; ir+=MR ) {
+            mr = min(mc-ir, MR); 
+
+	    if ( orderC=='C' ) Cptr = &Ccol(ic+ir,jc+jr);
+	    else               Cptr = &Crow(ic+ir,jc+jr);
+
+	    UKERNEL(mr, nr, kc, &Ablk[ir * kc], &Bc[jr * kc], Cptr, betaI, ldA, ldB, ldC);
+
+          }
+        }
+
+        #pragma omp barrier
+
+      }
+    }
+  }
+  }
+}
+
+void gemm_prepack_B3A2C0( char orderA, char orderB, char orderC, char transA, char transB, 
+                          int m, int n, int k, OUT_TYPE alpha, 
+	                  const PACK_TYPE *A, int ldA, const IN_TYPE *B, int ldB, 
+		          OUT_TYPE beta,  OUT_TYPE *C, int ldC, 
+		          PACK_TYPE *Ac, PACK_TYPE *Bc, 
+		          int loop, OUT_TYPE *Ctmp, char prepack) {
+
+  int ic, jc, pc, mc, nc, kc, ir, jr, mr, nr, j, i, kc_chunk, kc_packA, kc_packB, mc_pack;
+  size_t jr_lim, ir_lim;
+  
+  OUT_TYPE one = 1, betaI; 
+  const IN_TYPE *Bptr;
+  const PACK_TYPE *Aptr;
+  OUT_TYPE *Cptr;
+  OUT_TYPE *Ctmp_th;
+  
+  size_t jr_init, jr_limit, ir_init, ir_limit;
+  int th_id, th_num;
+
+  int NC = n;
+  int MC = YOLO_MC;
+  int KC = YOLO_KC;
+
+  int MR, NR;
+
+  #ifdef NQ_FP32
+    uk_intrinsic_fp32 uk;
+    if (n==4) {MR=YOLO_MR; NR=4;       uk = ukernel_16x4_fp32;}
+    else      {MR=YOLO_MR; NR=YOLO_NR; uk = ukernel_16x8_fp32;}
+  #else
+    uk_intrinsic_fp16 uk;
+    if (n==4) {MR=YOLO_MR; NR=4;       uk = ukernel_16x4_fp16;}
+    else      {MR=YOLO_MR; NR=YOLO_NR; uk = ukernel_16x8_fp16;}
+  #endif
+ 
+  const size_t M_pad = ((size_t)m + MR - 1) / MR * MR;
+  
+  #pragma omp parallel private(jr_init, jr_limit, ir_init, ir_limit, jc, nc, pc, kc, Aptr, Bptr, ic, mc, Cptr, \
+                               Ctmp_th, jr, nr, ir, mr, th_id, th_num, betaI, kc_chunk, kc_packA, kc_packB, mc_pack)
+  {
+
+  th_id   = omp_get_thread_num();
+  th_num  = omp_get_num_threads();
+  Ctmp_th = &Ctmp[th_id * MR * NR];
+  
+  for ( jc=0; jc<n; jc+=NC ) {
+    nc = min(n-jc, NC); 
+    int its_nc = (int) ceil((double)nc/NR/th_num);
+
+    if (loop == LOOP_JR) { jr_limit = min(nc,(th_id+1)*(its_nc*NR)); jr_init = th_id*(its_nc*NR); }
+    else { jr_limit = nc; jr_init = 0;}
+
+    for ( pc=0; pc<k; pc+=KC ) {
+      kc = min(k-pc, KC); 
+
+      if      ( (transB=='N')&&(orderB=='C') ) Bptr = &Bcol(pc, jc + its_nc * NR * th_id);
+      else if ( (transB=='N')&&(orderB=='R') ) Bptr = &Brow(pc, jc + its_nc * NR * th_id);
+      else if ( (transB=='T')&&(orderB=='C') ) Bptr = &Bcol(jc + its_nc * NR * th_id, pc);
+      else                                     Bptr = &Brow(jc + its_nc * NR * th_id, pc);
+
+      PACK_B( orderB, transB, kc, min(its_nc * NR, nc - its_nc * NR * th_id), 
+              Bptr, ldB, Bc + kc * its_nc * NR * th_id, NR);
+
+      if ( pc==0 ) betaI = beta;
+      else betaI = one;
+
+      #pragma omp barrier 
+
+      for ( ic=0; ic<m; ic+=MC ) {
+        mc = min(m-ic, MC); 
+	mc_pack = (int)ceil((double)mc / (double)MR) * MR;
+	int its_mc = (int) ceil((double)mc/MR/omp_get_num_threads());
+	
+	if (loop == LOOP_IR) { ir_limit = min(mc,(th_id+1)*(its_mc*MR)); ir_init = th_id*(its_mc*MR); }
+	else { ir_limit = mc; ir_init = 0;}
+
+	const PACK_TYPE *Ablk = A + (size_t)pc * M_pad + (size_t)ic * kc; 
+
+	for (jr=jr_init; jr<jr_limit; jr+=NR) {
+          nr = min(nc-jr, NR); 
+          for (ir=ir_init; ir<ir_limit; ir+=MR ) {
+            mr = min(mc-ir, MR); 
+
+	    if ( orderC=='C' ) Cptr = &Ccol(ic+ir,jc+jr);
+	    else               Cptr = &Crow(ic+ir,jc+jr);
+
+	    UKERNEL(mr, nr, kc, &Ablk[ir * kc], &Bc[jr * kc], Cptr, betaI, ldA, ldB, ldC);
+
+          }
+        }
+
+      }
+
+      #pragma omp barrier
+    }
+  }
+  }
+}
+
+
+
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+//+---------------------------------------------+
+//|  +=======================================+  |
+//|  |             PACKING ENGINES           |  |
+//|  +=======================================+  |
+//+---------------------------------------------+
+//------------------------------------------------------------------
+//                  Packing for DOT PRODUCTS!                     |
+//------------------------------------------------------------------
+
+// Pack B VMADOT (Riscv1.0). Multiply a Tile of Matrix of (4 x 4 x 8)
+void pack_vmadot_Ccol_B(char orderM, char transM, int kc, int nc, IN_TYPE *M, int ldM, PACK_TYPE *Mc, int NR) {
+  int    i, ii, j, jj, k, nr, kr;
+  
+  //WARNING: Packing for K1 with vlen=256. With int8|uint8_t we can store KR=32. 
+  //Adjust KR for other vlen (i.e. for vlen=128, you must set KR=16).
+  int KR = 8; 
+  
+  if ( orderM=='C') { //Order by columns
+    for ( j=0; j < nc; j+=NR ) { //Packing NR x KR
+      nr = min( nc-j, NR ); 
+      for ( i=0; i < kc; i+=KR ) {
+        kr = min( kc - i, KR );
+        for ( jj=0; jj < nr; jj++ ) {
+          for ( ii=0; ii < kr; ii++ ) {
+            Mc[k] = Mcol(i+ii, j+jj); k++;
+          }
+          k += KR - kr;
+        }
+        k += (NR - nr) * KR;
+      }
+    }
+  } else { //Order by rows
+    printf("Packing A-row for vmadot riscv1.0 not implemented\n"); exit(-1);
+  }
+
+}
+// Pack A VMADOT (Riscv1.0). Multiply a Tile of Matrix of (4 x 4 x 8)
+void pack_vmadot_Ccol_A(char orderM, char transM,  int mc, int kc, IN_TYPE *M, int ldM, PACK_TYPE *Mc, int MR) {
+  int i, j, ii, jj, k, mr, kr;
+
+  //WARNING: Packing for K1 with vlen=256. With int8|uint8_t we can store KR=32. 
+  //Adjust KR for other vlen (i.e. for vlen=128, you must set KR=16).
+  int KR = 8;
+  k = 0;
+    for ( i=0; i < mc; i+=MR ) {
+      mr = min( mc-i, MR );
+      for ( j=0; j < kc; j+=KR ) {//Packing MR x KR
+        kr = min( kc-j, KR );
+        for ( ii=0; ii < mr; ii++ ) {
+          for ( jj=0; jj < kr; jj++ ) {
+            Mc[k] = Mcol(i+ii, j+jj);
+            k++;
+          }
+          for (; jj < KR; jj++) { Mc[k] = 0; k++; }
+          //k += KR - kr;
+        }
+        k += (MR - mr) * KR;
+      }
+    }
+}
+
+
+void pack_generic_MRxkc_A(
+    char orderM, char transM,
+    int mc, int nc,
+    IN_TYPE *M, int ldM,
+    PACK_TYPE *Mc, int RR)
+{
+    int i, j, l, pa, offseta = 0;
+
+    printf("RR=%d\n", RR);
+    for (j = 0; j < nc; ++j) {
+        const IN_TYPE *col = &Mcol(0, j);
+        pa = offseta;
+
+        for (i = 0; i < i <= mc - (RR - 1); i += RR) {
+            for (l = 0; l < RR; l++) Mc[pa + l] = (PACK_TYPE)col[i + l];
+            pa += RR * nc;
+        }
+
+        for (; i < mc; i++) Mc[pa++] = (PACK_TYPE)col[i];
+
+        offseta += RR;
+    }
+    printf("pack done\n");
+}
+
+
+/*
+void pack_generic_MRxkc_A(
+    char orderM, char transM,
+    int mc, int nc,
+    IN_TYPE *M, int ldM,
+    PACK_TYPE *Mc, int RR) {
+    int i, j, l, pa, offseta = 0;
+
+    for (j = 0; j < nc; ++j) {
+        const IN_TYPE *col = &Mcol(0, j);
+        pa = offseta;
+
+        for (i = 0; i < mc - 15; i += 16) {
+            for (l = 0; l < 16; l++) Mc[pa + l] = (PACK_TYPE)col[i + l];
+            pa += 16 * nc;
+        }
+
+        for (; i < mc; i++) Mc[pa++] = (PACK_TYPE)col[i];
+
+        offseta += 16;
+    }
+}
+*/
+
+#ifdef NQ_FP32
+void pack_generic_16xkc_rvv_A(
+    char orderM, char transM,
+    int mc, int nc,
+    IN_TYPE *M, int ldM,
+    PACK_TYPE *Mc, int RR)
+{
+    int i, j, ii, pa, offseta;
+    size_t vl = __riscv_vsetvl_e32m2(16);
+
+    offseta = 0;
+    for (j = 0; j < nc; ++j) {
+	pa = offseta;
+        for (i = 0; i < mc - 15; i += 16) {
+            vfloat32m2_t A0 = __riscv_vle32_v_f32m2(&Mcol(i, j), vl);
+            __riscv_vse32_v_f32m2(&Mc[pa], A0, vl);
+	    pa += 16 * nc;
+        }
+
+        for (; i < mc; i++) Mc[pa++] = (PACK_TYPE)Mcol(i, j);
+
+	pa += YOLO_MC - mc;
+	offseta += 16;
+    }
+}
+
+void pack_generic_64xkc_A(
+    char orderM, char transM,
+    int mc, int nc,
+    IN_TYPE *M, int ldM,
+    PACK_TYPE *Mc, int RR)
+{
+    int i, j, ii, pa, offseta;
+
+    size_t vl = __riscv_vsetvl_e32m8(64);
+
+    offseta = 0;
+    for (j = 0; j < nc; ++j) {
+	pa = offseta;
+        for (i = 0; i < mc - 63; i += 64) {
+            vfloat32m8_t A0 = __riscv_vle32_v_f32m8(&Mcol(i, j), vl);
+            __riscv_vse32_v_f32m8(&Mc[pa], A0, vl);
+	    pa += 64 * nc;
+        }
+        
+        for (; i < mc; i++) {
+            Mc[pa] = (PACK_TYPE)Mcol(i, j);
+	    pa++;
+        }
+	offseta += 64;
+    }
+}
+
+#endif
+
+
+void pack_generic_A( char orderM, char transM, int mc, int nc, IN_TYPE *M, int ldM, PACK_TYPE *Mc, int RR ){
+  int    i, j, ii, k, rr;
+
+  if ( ((transM=='N')&&( orderM=='C'))||
+       ((transM=='T')&&( orderM=='R')) ) {
+    for ( i=0; i<mc; i+=RR ) { 
+      k = i*nc;
+      rr = min( mc-i, RR );
+      
+      for ( j=0; j<nc; j++ ) {
+        for ( ii=0; ii<rr; ii++ ) {
+	  Mc[k] = (PACK_TYPE)Mcol(i+ii, j);
+          k++;
+        } 
+        k += (RR-rr);
+      }
+    }
+  } else {
+    for ( i=0; i<mc; i+=RR ) { 
+      k = i*nc;
+      rr = min( mc-i, RR );
+      for ( j=0; j<nc; j++ ) {
+        for ( ii=0; ii<rr; ii++ ) {
+           Mc[k] = (PACK_TYPE)Mcol(j,i+ii);
+          k++;
+        }
+        k += (RR-rr);
+      }
+    }
+  }
+}
+
+
+
+//Generic Packing for GEMM
+void pack_generic_B( char orderM, char transM, int mc, int nc, IN_TYPE *M, int ldM, PACK_TYPE *Mc, int RR ){
+  int    i, j, jj, k, nr;
+
+  k = 0;
+  if ( ((transM=='N')&&( orderM=='C'))||
+       ((transM=='T')&&( orderM=='R')) )
+    for ( j=0; j<nc; j+=RR ) { 
+      k = j*mc;
+      nr = min( nc-j, RR );
+      for ( i=0; i<mc; i++ ) {
+        for ( jj=0; jj<nr; jj++ ) {
+          Mc[k] = (PACK_TYPE)Mcol(i,j+jj);
+          k++;
+        }
+        k += (RR-nr);
+      }
+    }
+  else
+    for ( j=0; j<nc; j+=RR ) { 
+      k = j*mc;
+      nr = min( nc-j, RR );
+      for ( i=0; i<mc; i++ ) {
+        for ( jj=0; jj<nr; jj++ ) {
+          Mc[k] = (PACK_TYPE)Mcol(j+jj,i);
+          k++;
+        }
+        k += (RR-nr);
+      }
+    }
+}
+
+
+//Packing for Batch GEMM. 
+void pack_bch_RB( char orderM, char transM, int mc, int nc, BCH_IN_TYPE *M, int ldM, BCH_PACK_TYPE *Mc, int RR ){
+  int    i, j, ii, k, rr;
+
+  if ( ((transM=='N')&&( orderM=='C'))||
+       ((transM=='T')&&( orderM=='R')) ) {
+    for ( i=0; i<mc; i+=RR ) { 
+      k = i*nc;
+      rr = min( mc-i, RR );
+      
+      for ( j=0; j<nc; j++ ) {
+        for ( ii=0; ii<rr; ii++ ) {
+	  Mc[k] = Mcol(i+ii, j);
+          k++;
+        } 
+        k += (RR-rr);
+      }
+    }
+  } else {
+    for ( i=0; i<mc; i+=RR ) { 
+      k = i*nc;
+      rr = min( mc-i, RR );
+      for ( j=0; j<nc; j++ ) {
+        for ( ii=0; ii<rr; ii++ ) {
+           Mc[k] = Mcol(j,i+ii);
+          k++;
+        }
+        k += (RR-rr);
+      }
+    }
+  }
+}
+
+
+//Packing for Batch GEMM. 
+void pack_bch_CB( char orderM, char transM, int mc, int nc, BCH_IN_TYPE *M, int ldM, BCH_PACK_TYPE *Mc, int RR ){
+  int    i, j, jj, k, nr;
+
+  k = 0;
+  if ( ((transM=='N')&&( orderM=='C'))||
+       ((transM=='T')&&( orderM=='R')) )
+    for ( j=0; j<nc; j+=RR ) { 
+      k = j*mc;
+      nr = min( nc-j, RR );
+      for ( i=0; i<mc; i++ ) {
+        for ( jj=0; jj<nr; jj++ ) {
+          Mc[k] = Mcol(i,j+jj);
+          k++;
+        }
+        k += (RR-nr);
+      }
+    }
+  else
+    for ( j=0; j<nc; j+=RR ) { 
+      k = j*mc;
+      nr = min( nc-j, RR );
+      for ( i=0; i<mc; i++ ) {
+        for ( jj=0; jj<nr; jj++ ) {
+          Mc[k] = Mcol(j+jj,i);
+          k++;
+        }
+        k += (RR-nr);
+      }
+    }
+}
+
+
+//Special packing for FP16
+void pack_6x16_fp16_A( char orderM, char transM, int mc, int kc, IN_TYPE *M, int ldM, PACK_TYPE *Mc, int RR ){
+  int  i, j, ii, k, rr;
+  int kc_left = kc % 4;
+
+  //MR=6
+  k=0;
+  for ( i=0; i<mc; i+=RR ) { 
+    //k = i*kc;
+    rr = min( mc-i, RR );
+
+    for ( j=0; j<kc-3; j+=4 ) {
+      for ( ii=0; ii<rr; ii++ ) {
+	Mc[k] = (PACK_TYPE)Mcol(i+ii, j+0); k++;
+	Mc[k] = (PACK_TYPE)Mcol(i+ii, j+1); k++;
+	Mc[k] = (PACK_TYPE)Mcol(i+ii, j+2); k++;
+	Mc[k] = (PACK_TYPE)Mcol(i+ii, j+3); k++;
+      } 
+      k += (RR-rr) * 4;
+    }
+
+    for (; j < kc; j++) {
+      for ( ii=0; ii<rr; ii++ ) {
+	Mc[k] = (PACK_TYPE)Mcol(i+ii, j); k++;
+      } 
+      k += (RR-rr) * 4;
+    }
+
+    k += (RR * kc_left);
+
+  }
+
+}
+
+
+void pack_6x16_fp16_B( char orderM, char transM, int kc, int nc, IN_TYPE *M, int ldM, PACK_TYPE *Mc, int RR ){
+  int    i, j, jj, k, nr;
+
+  //TODO: kc mutiply by 4
+  //(NR=16) and (KC % 4 == 0)
+  for ( j=0; j<nc; j+=RR ) { 
+    k = j*kc;
+    nr = min( nc-j, RR );
+    for ( i=0; i<kc; i++ ) {
+      for ( jj=0; jj<nr; jj++ ) {
+        Mc[k] = (PACK_TYPE)Mcol(i,j+jj);
+        k++;
+      }
+      k += (RR-nr);
+    }
+  }
+
+}
+
+//-------------------------
+//Packing for DOT PRODUCTS!
+//-------------------------
+//WARNING: Packings for int8_t quantization with support for sdot vector intrinsic instrucction
+void pack_sdot_A(char orderA, char transM,  int mc, int kc, IN_TYPE *M, int ldM, PACK_TYPE *Mc, int MR) {
+  int p = 0;
+
+  //16 values int8_t for a vectorial register
+  int KR = 16;
+  int kr_lim, i, j, ii, jj, mr;
+
+  if (orderA == 'C') {
+
+    for (i = 0; i < mc; i += MR) {
+      mr = min(MR, mc - i);
+      for (j = 0; j < kc; j += KR) {
+        for (ii = 0; ii < mr; ii++) {
+          kr_lim = min(KR, kc - j);
+          for (jj = 0; jj < kr_lim; jj++) {
+            Mc[p] = Mcol(i + ii, j + jj);
+            p++;
+          }
+          p += KR - jj;
+          //for (; jj < KR; jj++) { 
+          //Mc[p] = 0; p++; 
+          //}
+        }
+        //for( ii = 0; ii < (MR - mr) * KR; ii++) { Mc[p] = 0; p++; }
+        p += (MR - mr) * KR;
+      }
+    }
+
+
+  } else { printf("Not implemented\n"); exit(-1); }
+
+  //for (int ti = 0; i < mc * (kc + KR); i++) { printf("%d, ", Mc[i]); } printf("\n");
+}
+
+//WARNING: Packings for int8_t quantization with support for sdot vector intrinsic instrucction
+void pack_sdot_B(char orderB, char transB, int kc, int nc, IN_TYPE *M, int ldM, PACK_TYPE *Mc, int NR) {
+  int p = 0;
+
+  //16 values int8_t for a vectorial register
+  int KR = 16;
+  int kr_lim, i, j, jj, jjj, ii;
+
+  int kc_4_padding = 4 - kc % 4;
+  int kc_padding   = kc % 16;
+
+  int nr;
+
+  //printf("Packing B (kc=%d x nc=%d):\n", kc, nc);
+  if (orderB == 'C') {
+    for (i = 0; i < nc; i += NR) {
+      nr = min(NR, nc - i);
+      for (j = 0; j < kc; j += KR) {
+        kr_lim = min(KR, kc - j);
+        for (jj =0 ; jj < kr_lim - 3; jj += 4) {
+          for (ii =0 ; ii < nr; ii++) {
+            Mc[p] = Mcol(j + jj + 0, i + ii); p++;
+            Mc[p] = Mcol(j + jj + 1, i + ii); p++;
+            Mc[p] = Mcol(j + jj + 2, i + ii); p++;
+            Mc[p] = Mcol(j + jj + 3, i + ii); p++;
+          }
+          for (ii=0; ii < NR - nr; ii++) {
+            Mc[p]=0;p++; Mc[p]=0;p++; Mc[p]=0;p++; Mc[p]=0;p++;
+          }
+        }
+
+        if (jj != KR) {
+          for (ii =0 ; ii < nr; ii++) {
+            for (jjj=jj; jjj < kr_lim; jjj++) { //kc left
+              Mc[p] = Mcol(j + jjj, i + ii); p++;
+            }
+            for (jjj = 0; jjj < kc_4_padding; jjj++) {
+              Mc[p] = 0; p++;
+            }
+          }
+          for (jjj=0; jjj < nr * (KR - (kr_lim + kc_4_padding)); jjj++) {Mc[p] = 0; p++;}
+        }
+
+
+      }
+    }
+
+  } else { printf("Not implemented\n"); exit(-1); }
+
+  //printf("-------------------------------------------------------------------\n");
+  //for (int i = 0; i < nc * (kc + KR); i++) { printf("%d, ", Mc[i]); if (i % 4 == 0) printf("\n");} printf("\n");
+}
+
+
+void pack_2x8_int8_A(char orderA, char transA, int mc, int kc, IN_TYPE *M, int ldM, PACK_TYPE *Mc, int MR) {
+  int p = 0;
+
+  //16 values int8_t for a vectorial register
+  int KR = 16;
+  int kr_lim, i, j, ii, jj, mr;
+
+  if (orderA == 'C') {
+    for (i = 0; i < mc; i += MR) {
+      mr = min(MR, mc - i);
+      for (j = 0; j < kc; j += KR) {
+        for (ii = 0; ii < mr; ii++) {
+          kr_lim = min(KR, kc - j);
+          for (jj = 0; jj < kr_lim; jj++) {
+            Mc[p] = Mcol(i + ii, j + jj);
+            p++;
+          }
+          for (; jj < KR; jj++) { Mc[p] = 0; p++; }
+        }
+        if (mr != MR) for(ii=0; ii < KR; ii++) { Mc[p] = 0; p++; }
+      }
+    }
+
+  } else { printf("Not implemented\n"); exit(-1); }
+
+}
+
+void pack_2x8_int8_B(char orderB, char transB, int kc, int nc, IN_TYPE *M, int ldM, PACK_TYPE *Mc, int NR) {
+  int p = 0;
+
+  //16 values int8_t for a vectorial register
+  int KR = 16;
+  int kr_lim, i, j, jj, jjj, ii;
+  int nr;
+
+  if (orderB == 'C') {
+    for (i = 0; i < nc; i += NR) {
+      nr = min(NR, nc - i);
+        for (j = 0; j < kc; j += KR) {
+          kr_lim = min(KR, kc - j);
+          for (ii =0 ; ii < nr; ii++) {
+            for (jj =0 ; jj < kr_lim; jj++) {
+              Mc[p] = Mcol(j + jj, i + ii); p++;
+            }
+            p += KR - kr_lim;
+          }
+          p += (NR - nr) * KR;
+        }
+      }
+
+  } else { printf("Not implemented\n"); exit(-1); }
+
+}
+
+
+
+
+
+
+
+void prepack_B( char orderB, size_t n, size_t k, IN_TYPE *B, size_t ldB, PACK_TYPE *Bc, size_t NC, size_t KC, int NR) {
+
+  int jc, pc, nc, kc, kc_pack, nc_pack;
+  IN_TYPE *Bptr;
+
+  if ((n==0) || (k==0)) return;
+
+  for ( jc=0; jc<n; jc+=NC ) {
+    nc = min(n-jc, NC);
+    nc_pack = (int)ceil((double)nc / (double)NR) * NR;
+
+    for ( pc=0; pc<k; pc+=KC) {
+      kc = min(k-pc, KC);
+      kc_pack = (int)ceil((double)kc / 16.0) * 16;
+
+      if (orderB == 'C') Bptr = &Bcol(pc,jc);
+      else               Bptr = &Brow(pc,jc);
+
+      PACK_B(orderB, 'N', kc, nc, Bptr, ldB, Bc, NR);
+      Bc += nc_pack * kc_pack;
+
+    }
+
+  }
+
+}
+
+void prepack_A( char orderA, size_t m, size_t k, IN_TYPE *A, size_t ldA, PACK_TYPE *Ac,
+                size_t MC, size_t KC, int MR) {
+
+  int ic, pc, mc, kc, kc_pack, mc_pack;
+  IN_TYPE *Aptr;
+  pack_intrinsic_fp32 pack = pack_generic_MRxkc_A;
+
+  if ((m==0) || (k==0)) return;
+
+  for ( pc=0; pc<k; pc+=KC) {
+    kc = min(k-pc, KC);
+
+    for ( ic=0; ic<m; ic+=MC ) {
+      mc = min(m-ic, MC);
+
+      if (orderA == 'C') Aptr = &Acol(ic, pc);
+      else               Aptr = &Arow(ic, pc);
+
+      pack(orderA, 'N', mc, kc, Aptr, ldA, Ac, MR);
+      Ac += YOLO_MC * kc;
+
+    }
+  }
+}
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+void gemm_base_Cresident( char orderC, int m, int n, int k, 
+                          OUT_TYPE alpha, IN_TYPE *A, int ldA, 
+                          IN_TYPE *B, int ldB, OUT_TYPE beta, OUT_TYPE *C, int ldC ){
+/*
+  Baseline micro-kernel 
+  Replace with specialized micro-kernel where C-->m x n is resident in registers
+*/
+  int    i, j, p;
+  OUT_TYPE  zero = 0.0, tmp;
+
+  for ( j=0; j<n; j++ )
+    for ( i=0; i<m; i++ ) {
+      tmp = 0.0; 
+      for ( p=0; p<k; p++ ) 
+        tmp += Acol(i,p) * Brow(p,j);
+
+      if ( beta==zero ) {
+        if ( orderC=='C' )
+          Ccol(i,j) = alpha*tmp;
+        else
+          Crow(i,j) = alpha*tmp;
+      }
+      else {
+        if ( orderC=='C' )
+          Ccol(i,j) = alpha*tmp + beta*Ccol(i,j);
+        else
+          Crow(i,j) = alpha*tmp + beta*Crow(i,j);
+      }
+    }
+}
+
+
+void gemm( char orderA, char orderB, char orderC, char transA, char transB, 
+           size_t m, size_t n, size_t k, OUT_TYPE alpha, IN_TYPE *A, int ldA, 
+	   IN_TYPE *B, int ldB, OUT_TYPE beta,  OUT_TYPE *C, int ldC ){
+
+   size_t ic, jc, i, j, p;
+
+   OUT_TYPE  zero = 0.0, one = 1.0, tmp;
+
+   // Quick return if possible
+  if ( (m==0)||(n==0) || (((alpha==zero) || (k==0)) && (beta==one)) )
+    return;
+
+  #include "quick_gemm.h"
+
+  if ( (transA=='N')&&(transB=='N') ) {
+    for ( j=0; j<n; j++ ) 
+      for ( i=0; i<m; i++ ) {
+        tmp = 0.0; 
+        if ( (orderA=='C')&&(orderB=='C') ) {
+          for ( p=0; p<k; p++ )
+            tmp += Acol(i,p) * Bcol(p,j);
+        }
+        else if ( (orderA=='C')&&(orderB=='R') ) {
+          for ( p=0; p<k; p++ )
+            tmp += Acol(i,p) * Brow(p,j);
+        }
+        else if ( (orderA=='R')&&(orderB=='C') ) {
+          for ( p=0; p<k; p++ )
+            tmp += Arow(i,p) * Bcol(p,j);
+        }
+        else {
+          for ( p=0; p<k; p++ )
+            tmp += Arow(i,p) * Brow(p,j);
+        }
+
+	if ( beta==zero ) {
+          if ( orderC=='C' )
+            Ccol(i,j) = alpha*tmp;
+          else
+            Crow(i,j) = alpha*tmp;
+        }
+	else {
+          if ( orderC=='C' )
+            Ccol(i,j) = alpha*tmp + beta*Ccol(i,j);
+          else
+            Crow(i,j) = alpha*tmp + beta*Crow(i,j);
+        }
+      }
+  }
+  else if ( (transA=='N')&&(transB=='T') ) {
+    for ( j=0; j<n; j++ ) 
+      for ( i=0; i<m; i++ ) {
+        tmp = 0.0; 
+        if ( (orderA=='C')&&(orderB=='C') ) {
+          for ( p=0; p<k; p++ )
+            tmp += Acol(i,p) * Bcol(j,p);
+        }
+        else if ( (orderA=='C')&&(orderB=='R') ) {
+          for ( p=0; p<k; p++ )
+            tmp += Acol(i,p) * Brow(j,p);
+        }
+        else if ( (orderA=='R')&&(orderB=='C') ) {
+          for ( p=0; p<k; p++ )
+            tmp += Arow(i,p) * Bcol(j,p);
+        }
+        else {
+          for ( p=0; p<k; p++ )
+            tmp += Arow(i,p) * Brow(j,p);
+        }
+
+	if ( beta==zero ) {
+          if ( orderC=='C' )
+            Ccol(i,j) = alpha*tmp;
+          else
+            Crow(i,j) = alpha*tmp;
+        }
+	else {
+          if ( orderC=='C' )
+            Ccol(i,j) = alpha*tmp + beta*Ccol(i,j);
+          else
+            Crow(i,j) = alpha*tmp + beta*Crow(i,j);
+        }
+      }
+  }
+  else if ( (transA=='T')&&(transB=='N') ) {
+    for ( j=0; j<n; j++ ) 
+      for ( i=0; i<m; i++ ) {
+        tmp = 0.0; 
+        if ( (orderA=='C')&&(orderB=='C') ) {
+          for ( p=0; p<k; p++ )
+            tmp += Acol(p,i) * Bcol(p,j);
+        }
+        else if ( (orderA=='C')&&(orderB=='R') ) {
+          for ( p=0; p<k; p++ )
+            tmp += Acol(p,i) * Brow(p,j);
+        }
+        else if ( (orderA=='R')&&(orderB=='C') ) {
+          for ( p=0; p<k; p++ )
+            tmp += Arow(p,i) * Bcol(p,j);
+        }
+        else {
+          for ( p=0; p<k; p++ )
+            tmp += Arow(p,i) * Brow(p,j);
+        }
+
+	if ( beta==zero ) {
+          if ( orderC=='C' )
+            Ccol(i,j) = alpha*tmp;
+          else
+            Crow(i,j) = alpha*tmp;
+        }
+	else {
+          if ( orderC=='C' )
+            Ccol(i,j) = alpha*tmp + beta*Ccol(i,j);
+          else
+            Crow(i,j) = alpha*tmp + beta*Crow(i,j);
+        }
+      }
+  }
+  else if ( (transA=='T')&&(transB=='T') ) {
+    for ( j=0; j<n; j++ ) 
+      for ( i=0; i<m; i++ ) {
+        tmp = 0.0; 
+        if ( (orderA=='C')&&(orderB=='C') ) {
+          for ( p=0; p<k; p++ )
+            tmp += Acol(p,i) * Bcol(j,p);
+        }
+        else if ( (orderA=='C')&&(orderB=='R') ) {
+          for ( p=0; p<k; p++ )
+            tmp += Acol(p,i) * Brow(j,p);
+        }
+        else if ( (orderA=='R')&&(orderB=='C') ) {
+          for ( p=0; p<k; p++ )
+            tmp += Arow(p,i) * Bcol(j,p);
+        }
+        else {
+          for ( p=0; p<k; p++ )
+            tmp += Arow(p,i) * Brow(j,p);
+        }
+
+	if ( beta==zero ) {
+          if ( orderC=='C' )
+            Ccol(i,j) = alpha*tmp;
+          else
+            Crow(i,j) = alpha*tmp;
+        }
+	else {
+          if ( orderC=='C' )
+            Ccol(i,j) = alpha*tmp + beta*Ccol(i,j);
+          else
+            Crow(i,j) = alpha*tmp + beta*Crow(i,j);
+        }
+      }
+  }
+  else {
+    printf("Error: Invalid options for transA, transB: %c %c\n", transA, transB);
+    exit(-1);
+  }
+}
+
+
+double gemm_validation(char order, char _transA, char _transB, IN_TYPE *A, IN_TYPE *B, 
+		       int m, int n, int k, OUT_TYPE alpha, OUT_TYPE beta, int ldA, int ldB, 
+		       int ldC, OUT_TYPE *C, OUT_TYPE *Cg) {
+
+  int j, i;
+  double tmp, nrm, error;
+  char _orderA = order;
+  char _orderB = order;
+  char _orderC = order;
+
+
+  // Test result
+  gemm( _orderA, _orderB, _orderC, _transA, _transB, m, n, k, alpha, A, ldA, B, ldB, beta, Cg, ldC );
+
+  error = 0.0;
+  nrm   = 0.0;
+  if ( _orderC=='C' )
+    for ( j=0; j<n; j++ )
+      for ( i=0; i<m; i++ ) {
+        tmp = (double) Cgcol(i,j)*Cgcol(i,j);
+	nrm += tmp*tmp;
+	tmp = (double) dabs(Cgcol(i,j)-Ccol(i,j)); 
+	//printf("Cref[%d, %d]=%.4f vs C=%.4f\n", i, j, Cgcol(i,j), Ccol(i,j));
+	error += tmp*tmp;
+      }
+  else
+    for ( j=0; j<n; j++ )
+      for ( i=0; i<m; i++ ) {
+        tmp = (double) Cgrow(i,j)*Cgrow(i,j);
+	nrm += tmp*tmp;
+	tmp = (double) dabs(Cgrow(i,j)-Crow(i,j)); 
+	error += tmp*tmp;
+      }
+
+  if ( nrm!=0.0 )
+    error = sqrt(error) / sqrt(nrm);
+  else
+    error = sqrt(error);
+
+
+  return error;
+
+}
