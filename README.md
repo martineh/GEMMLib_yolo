@@ -41,6 +41,7 @@ To run the experiments using the provided YOLO matrix dimensions, execute:
 
 
 ```bash
+chmod +x gemm.bin
 ./gemm.bin gemm_study/yolo.dat output/yolo.csv
 ```
 
