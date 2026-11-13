@@ -1072,7 +1072,7 @@ list(APPEND ATen_MOBILE_BENCHMARK_SRCS
 #-------------------------------------------------------------------
 #HMP: Add GEMMLib.so
 #-------------------------------------------------------------------
-list(APPEND ATen_CPU_DEPENDENCY_LIBS /home/martineh/workspace/vision/GEMMLib-rvv/install/lib/libGEMM.so)
+list(APPEND ATen_CPU_DEPENDENCY_LIBS /home/martineh/workspace/vision/GEMMLib_yolo/install/lib/libGEMM.so)
 #-------------------------------------------------------------------
 #-------------------------------------------------------------------
 
