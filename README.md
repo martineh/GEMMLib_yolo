@@ -111,3 +111,29 @@ It is essential to ensure that YOLO26 uses the previously compiled PyTorch insta
 **Note:** Installing Ultralytics may introduce additional dependencies. Make sure that the installation process does not replace the custom-built PyTorch version with a precompiled package.
 
 Once both components are correctly installed, the system will be ready to execute YOLO26 inference using the optimized RISC-V implementation with support for 256-bit vector processing units.
+
+## 5. YOLO26 Evaluation Dataset
+
+To evaluate the performance of the optimized YOLO26 implementation on RISC-V platforms, a dedicated evaluation dataset has been included in this repository.
+
+The dataset consists of **100 images selected for person detection**, collected from publicly available datasets. These images are intended to provide a consistent workload for evaluating the inference performance of YOLO26 using the optimized GEMM and GEMV implementations.
+
+The neural network used for the experiments is the **pre-trained YOLO26 model**, without additional training or fine-tuning.
+
+This setup enables a reproducible evaluation of the computational performance of the proposed optimizations under the same inference workload.
+
+## 6. References
+
+The following open-source frameworks and publicly available datasets have been used in this project:
+
+- **PyTorch:** Deep learning framework used to execute the neural network, including the modified computational kernels.  
+  https://github.com/pytorch/pytorch
+
+- **YOLO26 (Ultralytics):** Pre-trained object detection model used for inference and performance evaluation.  
+  https://docs.ultralytics.com/models/yolo26/
+
+- **COCO (Common Objects in Context):** Publicly available object detection dataset containing annotated images across multiple object categories, including persons.  
+  https://cocodataset.org/
+
+  Lin, T.-Y., et al. (2014). *Microsoft COCO: Common Objects in Context*. European Conference on Computer Vision (ECCV).  
+  https://arxiv.org/abs/1405.0312
